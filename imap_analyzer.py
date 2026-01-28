@@ -340,7 +340,7 @@ class IMAPAnalyzer:
             traceback.print_exc()
             return []
     
-    def analyze_domains(self, mailbox: str = "INBOX", unread_only: bool = True, group_by_email: bool = False) -> Dict[str, int]:
+    def analyze_domains(self, mailbox: str = "INBOX", unread_only: bool = True, group_by_email: bool = False) -> Tuple[Dict[str, int], int, int, Dict[str, set]]:
         """
         Analyze email domains or sender emails from selected mailbox.
         
@@ -350,15 +350,17 @@ class IMAPAnalyzer:
             group_by_email: If True, group by full sender email. If False, group by domain.
             
         Returns:
-            Dictionary mapping domain names or email addresses to email counts
+            Tuple of (dictionary mapping domain names or email addresses to email counts,
+                     number of unique domains, number of unique email addresses,
+                     dictionary mapping domains to sets of email addresses)
         """
         if not self.imap:
             print("✗ Not connected to IMAP server")
-            return {}
+            return {}, 0, 0, {}
         
         # Select mailbox
         if not self.select_mailbox(mailbox):
-            return {}
+            return {}, 0, 0, {}
         
         # Get email UIDs (unread only or all)
         filter_type = "unread" if unread_only else "all"
@@ -370,7 +372,7 @@ class IMAPAnalyzer:
         if total_emails == 0:
             filter_msg = "unread " if unread_only else ""
             print(f"No {filter_msg}emails found in mailbox")
-            return {}
+            return {}, 0, 0, {}
         
         # If filtering for unread, verify a sample to ensure search is working
         if unread_only and total_emails > 0:
@@ -394,6 +396,9 @@ class IMAPAnalyzer:
         print(f"Processing {total_emails} {filter_type} emails in batches of {self.batch_size}...")
         
         domain_counter = Counter()
+        unique_domains = set()
+        unique_emails = set()
+        domain_to_emails = {}  # Map domain -> set of email addresses
         processed = 0
         successfully_processed = 0
         
@@ -407,10 +412,25 @@ class IMAPAnalyzer:
             
             # Extract domains or emails based on grouping preference
             for uid, from_header in headers:
+                # Track both domain and email for statistics
+                domain = self.extract_domain(from_header)
+                email_addr = self.extract_email(from_header)
+                
+                # Add to unique sets (excluding "unknown")
+                if domain != "unknown":
+                    unique_domains.add(domain)
+                if email_addr != "unknown":
+                    unique_emails.add(email_addr)
+                    # Track domain to email mapping
+                    if domain not in domain_to_emails:
+                        domain_to_emails[domain] = set()
+                    domain_to_emails[domain].add(email_addr)
+                
+                # Group by domain or email based on preference
                 if group_by_email:
-                    key = self.extract_email(from_header)
+                    key = email_addr
                 else:
-                    key = self.extract_domain(from_header)
+                    key = domain
                 domain_counter[key] += 1
                 successfully_processed += 1
             
@@ -419,26 +439,46 @@ class IMAPAnalyzer:
             print(f"Progress: {processed}/{total_emails} ({progress:.1f}%)", end='\r')
         
         print(f"\n✓ Processed {processed} emails ({successfully_processed} with valid headers)")
-        return dict(domain_counter)
+        return dict(domain_counter), len(unique_domains), len(unique_emails), domain_to_emails
     
-    def print_results(self, domain_counts: Dict[str, int], group_by_email: bool = False):
+    def print_results(self, domain_counts: Dict[str, int], unique_domains: int, unique_emails: int, domain_to_emails: Dict[str, set], group_by_email: bool = False, min_count: int = 0):
         """
         Print sorted domain or email analysis results.
         
         Args:
             domain_counts: Dictionary mapping domains/emails to email counts
+            unique_domains: Number of unique domains
+            unique_emails: Number of unique email addresses
+            domain_to_emails: Dictionary mapping domains to sets of email addresses
             group_by_email: If True, label as "Email", otherwise "Domain"
+            min_count: Minimum count threshold to display (default: 0, shows all)
         """
         if not domain_counts:
             label = "emails" if group_by_email else "domains"
             print(f"No {label} found")
             return
         
+        # Keep original unfiltered data for statistics
+        original_domain_counts = domain_counts.copy()
+        
+        # Filter by minimum count if specified
+        filtered_domain_counts = domain_counts
+        if min_count > 0:
+            filtered_domain_counts = {k: v for k, v in domain_counts.items() if v >= min_count}
+            if not filtered_domain_counts:
+                label = "emails" if group_by_email else "domains"
+                print(f"No {label} found with count >= {min_count}")
+                return
+            domain_counts = filtered_domain_counts
+        
         # Sort by count (descending)
         sorted_items = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)
         
         label = "Email" if group_by_email else "Domain"
         print("\n" + "=" * 70)
+        if min_count > 0:
+            print(f"Showing {label.lower()}s with count >= {min_count}")
+            print("=" * 70)
         print(f"{label:<50} {'Count':>10} {'Percentage':>10}")
         print("=" * 70)
         
@@ -450,6 +490,44 @@ class IMAPAnalyzer:
         
         print("=" * 70)
         print(f"{'Total':<50} {total_emails:>10} {'100.00%':>10}")
+        
+        # Calculate statistics for filtered results
+        if min_count > 0:
+            # Extract unique domains and emails from filtered results
+            if group_by_email:
+                # If grouping by email, keys are email addresses
+                filtered_unique_emails_count = len([k for k in filtered_domain_counts.keys() if k != "unknown"])
+                # Extract unique domains from email addresses
+                filtered_unique_domains_set = {email.split('@')[1] for email in filtered_domain_counts.keys() 
+                                             if email != "unknown" and '@' in email}
+                filtered_unique_domains_count = len(filtered_unique_domains_set)
+            else:
+                # If grouping by domain, keys are domains
+                filtered_unique_domains_count = len([k for k in filtered_domain_counts.keys() if k != "unknown"])
+                # Calculate unique emails for filtered domains using domain_to_emails mapping
+                filtered_unique_emails_set = set()
+                for domain in filtered_domain_counts.keys():
+                    if domain != "unknown" and domain in domain_to_emails:
+                        filtered_unique_emails_set.update(domain_to_emails[domain])
+                filtered_unique_emails_count = len(filtered_unique_emails_set)
+        else:
+            # No filter, so filtered stats = all stats
+            filtered_unique_domains_count = unique_domains
+            filtered_unique_emails_count = unique_emails
+        
+        # Print statistics
+        print("\n" + "=" * 70)
+        print("Statistics:")
+        print("=" * 70)
+        if min_count > 0:
+            print("Filtered Results (count >= {}):".format(min_count))
+            print(f"  {'Unique domains:':<28} {filtered_unique_domains_count:>10}")
+            print(f"  {'Unique email addresses:':<28} {filtered_unique_emails_count:>10}")
+            print()
+            print("All Results:")
+        print(f"{'Unique domains:':<30} {unique_domains:>10}")
+        print(f"{'Unique email addresses:':<30} {unique_emails:>10}")
+        print("=" * 70)
     
     def close(self):
         """Close IMAP connection."""
@@ -474,6 +552,7 @@ Examples:
   python imap_analyzer.py -s imap.gmail.com -u user@gmail.com -p password
   python imap_analyzer.py -s imap.gmail.com -u user@gmail.com -p password -m "Sent"
   python imap_analyzer.py -s mail.example.com -u user@example.com -p pass --port 143 --no-ssl
+  python imap_analyzer.py -s imap.gmail.com -u user@gmail.com -p password --min-count 5
         """
     )
     
@@ -486,6 +565,7 @@ Examples:
     parser.add_argument('--batch-size', type=int, default=1000, help='Batch size for fetching (default: 1000)')
     parser.add_argument('--all', action='store_true', help='Process all emails (default: unread emails only)')
     parser.add_argument('--group-by-email', action='store_true', help='Group by sender email address (default: group by domain)')
+    parser.add_argument('--min-count', type=int, default=0, help='Minimum count threshold - only show domains/emails with count >= N (default: 0, shows all)')
     
     args = parser.parse_args()
     
@@ -505,14 +585,14 @@ Examples:
         # Analyze domains or emails (default: unread only, unless --all is specified)
         # Note: group_by_email only affects how results are grouped, not which emails are fetched
         unread_only = not args.all  # True by default (unread only), False if --all is passed
-        domain_counts = analyzer.analyze_domains(
+        domain_counts, unique_domains, unique_emails, domain_to_emails = analyzer.analyze_domains(
             args.mailbox, 
             unread_only=unread_only,
             group_by_email=args.group_by_email
         )
         
         # Print results
-        analyzer.print_results(domain_counts, group_by_email=args.group_by_email)
+        analyzer.print_results(domain_counts, unique_domains, unique_emails, domain_to_emails, group_by_email=args.group_by_email, min_count=args.min_count)
         
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
